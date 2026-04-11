@@ -1,0 +1,24 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.5.2.0
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "StartMenuOrganizer", "StartMenuOrganizer.csproj", "{B3901BAB-5EF7-49CD-7996-5B50158298CB}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{B3901BAB-5EF7-49CD-7996-5B50158298CB}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B3901BAB-5EF7-49CD-7996-5B50158298CB}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B3901BAB-5EF7-49CD-7996-5B50158298CB}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B3901BAB-5EF7-49CD-7996-5B50158298CB}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {D1336A54-582F-419F-A477-2AB02DD5785D}
+	EndGlobalSection
+EndGlobal
