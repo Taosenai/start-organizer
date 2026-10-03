@@ -21,6 +21,11 @@ catch (ArgumentException ex)
     Console.Error.WriteLine(ex.Message);
     return 1;
 }
+catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or COMException)
+{
+    Console.Error.WriteLine(ex.Message);
+    return 2;
+}
 
 [SupportedOSPlatform("windows")]
 static int RunOnWindows(string[] args)
@@ -33,13 +38,19 @@ static int RunOnWindows(string[] args)
         return 0;
     }
 
-    if (args.Length > 1 || (args.Length == 1 && !args[0].Equals("--apply", StringComparison.OrdinalIgnoreCase)))
+    bool apply = args.Any(arg => arg.Equals("--apply", StringComparison.OrdinalIgnoreCase));
+    string? undo = null;
+    for (int i = 0; i < args.Length; i++)
     {
-        throw new ArgumentException(
-            "Unsupported command-line option. Use --apply to make changes, --help for usage, or edit start-organizer.config.json for all other settings.");
+        if (args[i].Equals("--apply", StringComparison.OrdinalIgnoreCase)) continue;
+        if (args[i].Equals("--undo", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+        {
+            undo = args[++i];
+            continue;
+        }
+        throw new ArgumentException("Use --apply, --undo <backup-directory>, or --help.");
     }
-
-    bool apply = args.Length == 1;
+    if (undo is not null) return BackupSession.Undo(undo, apply, MenuSafety.StartMenuRoots());
     Options options = Options.LoadOrCreateDefaultConfig(apply);
     var organizer = new Organizer(options);
     return organizer.Run();
@@ -53,10 +64,12 @@ static void PrintUsage()
 
         Usage:
           start-organizer [--apply]
+          start-organizer --undo <backup-directory> [--apply]
           start-organizer --help
 
         Options:
           --apply      Make changes. Without this, a dry run is printed.
+          --undo       Preview restoration of a backup; add --apply to restore.
           -h, --help   Show help.
 
         Configuration:
@@ -77,11 +90,6 @@ internal sealed class Organizer
     private static readonly Regex ArchitectureSuffixPattern = new(
         @"\s+\((?:x64|x86)\)$",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-
-    private static readonly NormalizedRemovalTerm[] RemoveOnlyTerms =
-    [
-        new("remove", "remove")
-    ];
 
     private readonly Options _options;
     private readonly List<NormalizedRemovalTerm> _removalTerms;
@@ -110,77 +118,68 @@ internal sealed class Organizer
             Console.WriteLine("Note: the global Start Menu usually requires an elevated terminal.");
         }
 
-        foreach (MenuRoot root in GetMenuRoots(_options))
+        List<MenuRoot> roots = GetMenuRoots(_options).ToList();
+        var candidates = new List<ShortcutCandidate>();
+        var removals = new List<MenuAction>();
+        foreach (MenuRoot root in roots)
         {
-            Stats stats = ProcessRoot(root);
-            total.Add(stats);
+            Console.WriteLine($"{root.Label}: {root.Path}");
+            if (!Directory.Exists(root.Path)) continue;
+            var shortcuts = GatherShortcuts(root, total);
+            foreach (FileInfo file in shortcuts)
+            {
+                total.ShortcutsScanned++;
+                string? inspectedHash = BackupSession.Hash(file.FullName);
+                ShortcutDisposition disposition = ClassifyShortcut(file, total, out string reason);
+                if (inspectedHash is null || BackupSession.Hash(file.FullName) != inspectedHash)
+                    throw new IOException($"Shortcut changed during classification: {file.FullName}");
+                if (disposition == ShortcutDisposition.Skip) continue;
+                if (disposition == ShortcutDisposition.Remove)
+                {
+                    removals.Add(new MenuAction("Remove", file.FullName, null, reason, OriginalHash: inspectedHash));
+                    continue;
+                }
+                ShortcutCandidate candidate = ShortcutCandidate.Read(root, file, GetDestinationFileName(file));
+                if (candidate.OriginalHash != inspectedHash)
+                    throw new IOException($"Shortcut changed during inspection: {file.FullName}");
+                if (file.Extension.Equals(".lnk", StringComparison.OrdinalIgnoreCase) && candidate.Link is null)
+                {
+                    total.Errors++;
+                    Console.Error.WriteLine($"Cannot read shortcut; left unchanged: {file.FullName}");
+                    continue;
+                }
+                candidates.Add(candidate);
+            }
         }
-
+        MenuPlan plan = MenuPlan.Create(candidates, removals, _options);
+        total.Errors += plan.Execute(_options, roots);
         Console.WriteLine();
-        Console.WriteLine("Summary:");
+        Console.WriteLine("Plan summary:");
         Console.WriteLine($"  Shortcuts scanned: {total.ShortcutsScanned}");
-        Console.WriteLine($"  Removed: {total.Removed}");
-        Console.WriteLine($"  Moved: {total.Moved}");
-        Console.WriteLine($"  Renamed: {total.Renamed}");
-        Console.WriteLine($"  Empty folders removed: {total.EmptyFoldersRemoved}");
+        Console.WriteLine($"  Removed: {plan.Actions.Count(action => action.Kind == "Remove")}");
+        Console.WriteLine($"  Moved: {plan.Actions.Count(action => action.Kind == "Move")}");
+        Console.WriteLine($"  Renamed: {plan.Actions.Count(action => action.Kind == "Rename")}");
+        Console.WriteLine($"  Replaced: {plan.Actions.Count(action => action.Kind == "Replace")}");
+        Console.WriteLine($"  Empty folders removed: {plan.EmptyFoldersRemoved}");
+        Console.WriteLine($"  Duplicates consolidated: {plan.Actions.Count(action => action.Kind == "Deduplicate")}");
+        Console.WriteLine($"  WSL shortcuts repaired: {plan.Actions.Count(action => action.Kind == "Repair")}");
         Console.WriteLine($"  Ignored folders: {total.IgnoredFolders}");
         Console.WriteLine($"  Errors: {total.Errors}");
+        if (_options.Apply) Console.WriteLine($"  Actions completed: {plan.AppliedActions} of {plan.Actions.Count}");
 
         return total.Errors == 0 ? 0 : 2;
     }
 
-    private Stats ProcessRoot(MenuRoot root)
+    internal List<FileInfo> GatherShortcuts(MenuRoot root, Stats stats)
     {
-        var stats = new Stats();
-
-        Console.WriteLine();
-        Console.WriteLine($"{root.Label}: {root.Path}");
-
-        if (!Directory.Exists(root.Path))
+        var shortcuts = EnumerateShortcuts(root, stats).ToList();
+        if (_options.IncludeStartMenuRoot)
         {
-            Console.WriteLine("  Skipped: folder does not exist.");
-            return stats;
+            var parent = new DirectoryInfo(Path.GetDirectoryName(root.Path)!);
+            shortcuts.AddRange(GetFiles(parent, stats).Where(file => IsShortcut(file) && ShouldInclude(file.Attributes)
+                && !file.Attributes.HasFlag(FileAttributes.ReparsePoint)));
         }
-
-        List<FileInfo> shortcuts = EnumerateShortcuts(root, stats).ToList();
-        var reservedDestinations = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var freedDestinations = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var touchedFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        foreach (FileInfo shortcut in shortcuts)
-        {
-            stats.ShortcutsScanned++;
-
-            ShortcutDisposition disposition = ClassifyShortcut(shortcut, stats, out string reason);
-            if (disposition == ShortcutDisposition.Skip)
-            {
-                continue;
-            }
-
-            if (disposition == ShortcutDisposition.Remove)
-            {
-                RemoveShortcut(root, shortcut, reason, stats, freedDestinations, touchedFolders);
-                continue;
-            }
-
-            if (!PathEquals(shortcut.DirectoryName, root.Path))
-            {
-                MoveShortcutToRoot(root, shortcut, stats, reservedDestinations, freedDestinations, touchedFolders);
-                continue;
-            }
-
-            if (ShouldRenameShortcut(shortcut))
-            {
-                RenameShortcutInRoot(root, shortcut, stats, reservedDestinations, freedDestinations);
-            }
-        }
-
-        if (!_options.KeepEmptyFolders)
-        {
-            RemoveEmptyFolders(root, stats, touchedFolders, freedDestinations);
-        }
-
-        return stats;
+        return shortcuts;
     }
 
     private IEnumerable<FileInfo> EnumerateShortcuts(MenuRoot root, Stats stats)
@@ -194,7 +193,7 @@ internal sealed class Organizer
 
             foreach (FileInfo file in GetFiles(current, stats).OrderBy(static file => file.FullName, StringComparer.OrdinalIgnoreCase))
             {
-                if (IsShortcut(file) && ShouldInclude(file.Attributes))
+                if (IsShortcut(file) && ShouldInclude(file.Attributes) && !file.Attributes.HasFlag(FileAttributes.ReparsePoint))
                 {
                     yield return file;
                 }
@@ -223,7 +222,7 @@ internal sealed class Organizer
                     continue;
                 }
 
-                if (_options.IgnoredFolders.Contains(child.Name))
+                if (child.Name.Equals("Startup", StringComparison.OrdinalIgnoreCase) || _options.IgnoredFolders.Contains(child.Name))
                 {
                     stats.IgnoredFolders++;
                     if (_options.Verbose)
@@ -272,8 +271,20 @@ internal sealed class Organizer
         }
     }
 
-    private ShortcutDisposition ClassifyShortcut(FileInfo shortcut, Stats stats, out string reason)
+    internal ShortcutDisposition ClassifyShortcut(FileInfo shortcut, Stats stats, out string reason)
     {
+        ShortcutInfo? shellLink = null;
+        if (shortcut.Extension.Equals(".lnk", StringComparison.OrdinalIgnoreCase))
+        {
+            if (!ShellLinkReader.TryRead(shortcut.FullName, out var readLink))
+            {
+                stats.Errors++;
+                Console.Error.WriteLine($"Cannot read shortcut; left unchanged: {shortcut.FullName}");
+                reason = string.Empty;
+                return ShortcutDisposition.Skip;
+            }
+            shellLink = readLink;
+        }
         string displayName = Path.GetFileNameWithoutExtension(shortcut.Name);
         if (ContainsRemovalTerm(displayName, out string nameTerm))
         {
@@ -313,8 +324,7 @@ internal sealed class Organizer
             }
         }
 
-        if (shortcut.Extension.Equals(".lnk", StringComparison.OrdinalIgnoreCase)
-            && ShellLinkReader.TryRead(shortcut.FullName, out ShortcutInfo link))
+        if (shellLink is { } link)
         {
             if (LooksLikeUninstaller(link, out string uninstallerReason))
             {
@@ -341,24 +351,23 @@ internal sealed class Organizer
 
     private bool LooksLikeUninstaller(ShortcutInfo link, out string reason)
     {
-        string combined = $"{Path.GetFileNameWithoutExtension(link.TargetPath)} {Path.GetFileName(link.TargetPath)} {link.Arguments} {link.Description}";
+        string combined = $"{Path.GetFileName(link.TargetPath)} {link.Arguments}";
         string compact = NormalizeForSearch(combined).Replace(" ", string.Empty, StringComparison.Ordinal);
-
         foreach (string term in new[] { "uninstall", "uninstaller", "uninst", "unins" })
         {
-            if (compact.Contains(term, StringComparison.OrdinalIgnoreCase))
+            if (_options.RemovalTerms.Contains(term, StringComparer.OrdinalIgnoreCase)
+                && compact.Contains(term, StringComparison.OrdinalIgnoreCase))
             {
-                reason = $"target/arguments contain '{term}'";
+                reason = $"target/arguments contain configured term '{term}'";
                 return true;
             }
         }
-
-        if (ContainsAnyNormalized(combined, RemoveOnlyTerms, out string removeTerm))
+        var removeTerms = _removalTerms.Where(term => term.Normalized == "remove");
+        if (ContainsAnyNormalized(combined, removeTerms, out string removeTerm))
         {
-            reason = $"target/arguments contain '{removeTerm}'";
+            reason = $"target/arguments contain configured term '{removeTerm}'";
             return true;
         }
-
         reason = string.Empty;
         return false;
     }
@@ -449,184 +458,6 @@ internal sealed class Organizer
             && !path.StartsWith(@"\\", StringComparison.Ordinal);
     }
 
-    private void RemoveShortcut(
-        MenuRoot root,
-        FileInfo shortcut,
-        string reason,
-        Stats stats,
-        HashSet<string> freedDestinations,
-        HashSet<string> touchedFolders)
-    {
-        Console.WriteLine($"  Remove: {Relative(root, shortcut.FullName)} ({reason})");
-
-        if (!_options.Apply)
-        {
-            stats.Removed++;
-            freedDestinations.Add(shortcut.FullName);
-            MarkTouchedFolder(root, shortcut, touchedFolders);
-            return;
-        }
-
-        try
-        {
-            shortcut.Delete();
-            stats.Removed++;
-            freedDestinations.Add(shortcut.FullName);
-            MarkTouchedFolder(root, shortcut, touchedFolders);
-        }
-        catch (Exception ex) when (ex is UnauthorizedAccessException or IOException)
-        {
-            stats.Errors++;
-            Console.Error.WriteLine($"    Error deleting {shortcut.FullName}: {ex.Message}");
-        }
-    }
-
-    private void MoveShortcutToRoot(
-        MenuRoot root,
-        FileInfo shortcut,
-        Stats stats,
-        HashSet<string> reservedDestinations,
-        HashSet<string> freedDestinations,
-        HashSet<string> touchedFolders)
-    {
-        string destinationName = GetDestinationFileName(shortcut);
-        string destination = GetDestinationPath(
-            root,
-            shortcut,
-            destinationName,
-            reservedDestinations,
-            freedDestinations,
-            BuildFolderSuffix(
-                root,
-                shortcut.Directory!,
-                Path.GetFileNameWithoutExtension(destinationName),
-                !shortcut.Name.Equals(destinationName, StringComparison.OrdinalIgnoreCase),
-                _options.RemoveVersionNumbers));
-
-        Console.WriteLine($"  Move: {Relative(root, shortcut.FullName)} -> {Path.GetFileName(destination)}");
-
-        if (!_options.Apply)
-        {
-            stats.Moved++;
-            reservedDestinations.Add(destination);
-            freedDestinations.Add(shortcut.FullName);
-            MarkTouchedFolder(root, shortcut, touchedFolders);
-            return;
-        }
-
-        try
-        {
-            File.Move(shortcut.FullName, destination, _options.OverwriteExistingShortcuts);
-            stats.Moved++;
-            reservedDestinations.Add(destination);
-            freedDestinations.Add(shortcut.FullName);
-            MarkTouchedFolder(root, shortcut, touchedFolders);
-        }
-        catch (Exception ex) when (ex is UnauthorizedAccessException or IOException)
-        {
-            stats.Errors++;
-            Console.Error.WriteLine($"    Error moving {shortcut.FullName}: {ex.Message}");
-        }
-    }
-
-    private void RenameShortcutInRoot(
-        MenuRoot root,
-        FileInfo shortcut,
-        Stats stats,
-        HashSet<string> reservedDestinations,
-        HashSet<string> freedDestinations)
-    {
-        string destinationName = GetDestinationFileName(shortcut);
-        string destination = GetDestinationPath(root, shortcut, destinationName, reservedDestinations, freedDestinations, "renamed");
-        Console.WriteLine($"  Rename: {shortcut.Name} -> {Path.GetFileName(destination)}");
-
-        if (!_options.Apply)
-        {
-            stats.Renamed++;
-            reservedDestinations.Add(destination);
-            freedDestinations.Add(shortcut.FullName);
-            return;
-        }
-
-        try
-        {
-            File.Move(shortcut.FullName, destination, _options.OverwriteExistingShortcuts);
-            stats.Renamed++;
-            reservedDestinations.Add(destination);
-            freedDestinations.Add(shortcut.FullName);
-        }
-        catch (Exception ex) when (ex is UnauthorizedAccessException or IOException)
-        {
-            stats.Errors++;
-            Console.Error.WriteLine($"    Error renaming {shortcut.FullName}: {ex.Message}");
-        }
-    }
-
-    private string GetDestinationPath(
-        MenuRoot root,
-        FileInfo shortcut,
-        string destinationName,
-        HashSet<string> reservedDestinations,
-        HashSet<string> freedDestinations,
-        string conflictSuffix)
-    {
-        string direct = Path.Combine(root.Path, destinationName);
-        if (IsDestinationAvailable(direct, reservedDestinations, freedDestinations)
-            || CanOverwriteDestination(shortcut, direct, reservedDestinations, freedDestinations))
-        {
-            return direct;
-        }
-
-        string baseName = Path.GetFileNameWithoutExtension(destinationName);
-        string extension = shortcut.Extension;
-        string candidate = Path.Combine(root.Path, $"{baseName} ({conflictSuffix}){extension}");
-
-        int counter = 2;
-        while (!IsDestinationAvailable(candidate, reservedDestinations, freedDestinations))
-        {
-            candidate = Path.Combine(root.Path, $"{baseName} ({conflictSuffix} {counter}){extension}");
-            counter++;
-        }
-
-        return candidate;
-    }
-
-    private static bool IsDestinationAvailable(
-        string path,
-        HashSet<string> reservedDestinations,
-        HashSet<string> freedDestinations)
-    {
-        return !reservedDestinations.Contains(path)
-            && (!File.Exists(path) || freedDestinations.Contains(path))
-            && !Directory.Exists(path);
-    }
-
-    private bool CanOverwriteDestination(
-        FileInfo shortcut,
-        string destination,
-        HashSet<string> reservedDestinations,
-        HashSet<string> freedDestinations)
-    {
-        if (!_options.OverwriteExistingShortcuts
-            || reservedDestinations.Contains(destination)
-            || freedDestinations.Contains(destination)
-            || PathEquals(shortcut.FullName, destination)
-            || Directory.Exists(destination)
-            || !File.Exists(destination))
-        {
-            return false;
-        }
-
-        string extension = Path.GetExtension(destination);
-        return extension.Equals(".lnk", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals(".url", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private bool ShouldRenameShortcut(FileInfo shortcut)
-    {
-        return !shortcut.Name.Equals(GetDestinationFileName(shortcut), StringComparison.OrdinalIgnoreCase);
-    }
-
     private string GetDestinationFileName(FileInfo shortcut)
     {
         if (!_options.RemoveVersionNumbers)
@@ -655,146 +486,6 @@ internal sealed class Organizer
         while (!current.Equals(previous, StringComparison.Ordinal));
 
         return current;
-    }
-
-    private static void MarkTouchedFolder(MenuRoot root, FileInfo shortcut, HashSet<string> touchedFolders)
-    {
-        string? current = shortcut.DirectoryName;
-        while (!string.IsNullOrWhiteSpace(current) && !PathEquals(current, root.Path))
-        {
-            touchedFolders.Add(current);
-            current = Directory.GetParent(current)?.FullName;
-        }
-    }
-
-    private static string BuildFolderSuffix(
-        MenuRoot root,
-        DirectoryInfo sourceDirectory,
-        string destinationBaseName,
-        bool destinationNameChanged,
-        bool removeVersionNumbers)
-    {
-        string relative = Path.GetRelativePath(root.Path, sourceDirectory.FullName);
-        string[] rawPieces = relative.Split(
-            [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar],
-            StringSplitOptions.RemoveEmptyEntries);
-
-        bool suffixChanged = false;
-        var pieces = new List<string>();
-        foreach (string rawPiece in rawPieces)
-        {
-            string piece = removeVersionNumbers ? RemoveVersionSuffix(rawPiece) : rawPiece;
-            suffixChanged = suffixChanged || !piece.Equals(rawPiece, StringComparison.Ordinal);
-
-            piece = SanitizeFileNamePiece(piece);
-            if (piece.Length > 0)
-            {
-                pieces.Add(piece);
-            }
-        }
-
-        if ((suffixChanged || destinationNameChanged)
-            && pieces.Count == 1
-            && pieces[0].Equals(destinationBaseName, StringComparison.OrdinalIgnoreCase))
-        {
-            return "moved";
-        }
-
-        return pieces.Count == 0 ? "moved" : string.Join(" - ", pieces);
-    }
-
-    private static string SanitizeFileNamePiece(string value)
-    {
-        char[] invalid = Path.GetInvalidFileNameChars();
-        var builder = new StringBuilder(value.Length);
-
-        foreach (char c in value)
-        {
-            builder.Append(invalid.Contains(c) ? '_' : c);
-        }
-
-        return builder.ToString().Trim();
-    }
-
-    private void RemoveEmptyFolders(
-        MenuRoot root,
-        Stats stats,
-        HashSet<string> touchedFolders,
-        HashSet<string> plannedRemovedFiles)
-    {
-        List<string> folders = touchedFolders
-            .OrderByDescending(static path => path.Length)
-            .ToList();
-        var plannedRemovedFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        foreach (string folder in folders)
-        {
-            var directory = new DirectoryInfo(folder);
-
-            if (!directory.Exists)
-            {
-                continue;
-            }
-
-            if (directory.Attributes.HasFlag(FileAttributes.ReparsePoint)
-                || IsWithinIgnoredFolder(root, folder)
-                || (!_options.IncludeHidden && IsHiddenOrSystem(directory.Attributes)))
-            {
-                continue;
-            }
-
-            try
-            {
-                if (!WouldFolderBeEmptyAfterPlannedChanges(folder, plannedRemovedFiles, plannedRemovedFolders))
-                {
-                    continue;
-                }
-
-                Console.WriteLine($"  Remove empty folder: {Relative(root, folder)}");
-                if (_options.Apply)
-                {
-                    Directory.Delete(folder);
-                }
-
-                stats.EmptyFoldersRemoved++;
-                plannedRemovedFolders.Add(folder);
-            }
-            catch (Exception ex) when (ex is UnauthorizedAccessException or IOException)
-            {
-                stats.Errors++;
-                Console.Error.WriteLine($"    Error deleting folder {folder}: {ex.Message}");
-            }
-        }
-    }
-
-    private bool WouldFolderBeEmptyAfterPlannedChanges(
-        string folder,
-        HashSet<string> plannedRemovedFiles,
-        HashSet<string> plannedRemovedFolders)
-    {
-        foreach (string entry in Directory.EnumerateFileSystemEntries(folder))
-        {
-            string fullPath = Path.GetFullPath(entry);
-            if (!_options.Apply
-                && (plannedRemovedFiles.Contains(fullPath) || plannedRemovedFolders.Contains(fullPath)))
-            {
-                continue;
-            }
-
-            return false;
-        }
-
-        return true;
-    }
-
-    private bool IsWithinIgnoredFolder(MenuRoot root, string path)
-    {
-        string relative = Path.GetRelativePath(root.Path, path);
-        string[] pieces = relative.Split(
-            [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar],
-            StringSplitOptions.RemoveEmptyEntries);
-
-        return pieces.Any(piece => _options.IgnoredFolders.Contains(piece));
     }
 
     private bool ContainsRemovalTerm(string text, out string term)
@@ -973,7 +664,7 @@ internal sealed class Organizer
         return principal.IsInRole(WindowsBuiltInRole.Administrator);
     }
 
-    private enum ShortcutDisposition
+    internal enum ShortcutDisposition
     {
         Keep,
         Remove,
@@ -1052,8 +743,6 @@ internal sealed class Options
         "license",
         "eula",
         "website",
-        ".com",
-        ".url",
         "report a problem"
     ];
 
@@ -1064,7 +753,15 @@ internal sealed class Options
     public bool KeepEmptyFolders { get; private set; }
     public bool RemoveDeadShortcuts { get; private set; } = true;
     public bool RemoveVersionNumbers { get; private set; } = true;
-    public bool OverwriteExistingShortcuts { get; private set; } = true;
+    // Legacy configuration is accepted, but unrelated links are never overwritten.
+    public bool OverwriteExistingShortcuts { get; private set; }
+    public bool IncludeStartMenuRoot { get; private set; } = true;
+    public bool DeduplicateShortcuts { get; private set; } = true;
+    public bool PreferNewerVersions { get; private set; } = true;
+    public bool PreserveWslFolders { get; private set; } = true;
+    public bool RepairWslShortcuts { get; private set; } = true;
+    public string BackupDirectory { get; private set; } = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "start-organizer", "backups");
+    public List<string> PreservedFolders { get; } = [];
     public bool Verbose { get; private set; }
     public string? ConfigPath { get; private set; }
     public HashSet<string> IgnoredFolders { get; } = new(StringComparer.OrdinalIgnoreCase);
@@ -1156,17 +853,25 @@ internal sealed class Options
         }
     }
 
-    private static Options FromConfig(OrganizerConfig config)
+    internal static Options FromConfig(OrganizerConfig config, bool apply = false)
     {
         var options = new Options
         {
+            Apply = apply,
             IncludeLocal = config.IncludeLocal ?? true,
             IncludeGlobal = config.IncludeGlobal ?? true,
             IncludeHidden = config.IncludeHidden ?? false,
             KeepEmptyFolders = config.KeepEmptyFolders ?? false,
             RemoveDeadShortcuts = config.RemoveDeadShortcuts ?? true,
             RemoveVersionNumbers = config.RemoveVersionNumbers ?? true,
-            OverwriteExistingShortcuts = config.OverwriteExistingShortcuts ?? true,
+            OverwriteExistingShortcuts = config.OverwriteExistingShortcuts ?? false,
+            IncludeStartMenuRoot = config.IncludeStartMenuRoot ?? true,
+            DeduplicateShortcuts = config.DeduplicateShortcuts ?? true,
+            PreferNewerVersions = config.PreferNewerVersions ?? true,
+            PreserveWslFolders = config.PreserveWslFolders ?? true,
+            RepairWslShortcuts = config.RepairWslShortcuts ?? true,
+            BackupDirectory = Path.GetFullPath(Environment.ExpandEnvironmentVariables(config.BackupDirectory
+                ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "start-organizer", "backups"))),
             Verbose = config.Verbose ?? false
         };
 
@@ -1190,6 +895,7 @@ internal sealed class Options
         AddNames(options.IgnoredFolders, config.Ignores);
         AddNames(options.RemovalTerms, config.RemoveTerms);
         AddNames(options.RemovalTerms, config.RemovalTerms);
+        options.PreservedFolders.AddRange(config.PreservedFolders ?? ["Visual Studio *"]);
 
         return options;
     }
@@ -1267,6 +973,13 @@ internal sealed class OrganizerConfig
     public bool? RemoveDeadShortcuts { get; set; }
     public bool? RemoveVersionNumbers { get; set; }
     public bool? OverwriteExistingShortcuts { get; set; }
+    public bool? IncludeStartMenuRoot { get; set; }
+    public bool? DeduplicateShortcuts { get; set; }
+    public bool? PreferNewerVersions { get; set; }
+    public bool? PreserveWslFolders { get; set; }
+    public bool? RepairWslShortcuts { get; set; }
+    public string? BackupDirectory { get; set; }
+    public string[]? PreservedFolders { get; set; }
     public bool? Verbose { get; set; }
 
     public bool? UseDefaultIgnoredFolders { get; set; }
@@ -1294,7 +1007,13 @@ internal sealed class OrganizerConfig
             KeepEmptyFolders = false,
             RemoveDeadShortcuts = true,
             RemoveVersionNumbers = true,
-            OverwriteExistingShortcuts = true,
+            OverwriteExistingShortcuts = false,
+            IncludeStartMenuRoot = true,
+            DeduplicateShortcuts = true,
+            PreferNewerVersions = true,
+            PreserveWslFolders = true,
+            RepairWslShortcuts = true,
+            PreservedFolders = ["Visual Studio *"],
             Verbose = false,
             IgnoredFolders = Options.DefaultIgnoredFolders.ToArray(),
             RemoveTerms = Options.DefaultRemovalTerms.ToArray()
@@ -1305,28 +1024,15 @@ internal sealed class OrganizerConfig
 internal sealed class Stats
 {
     public int ShortcutsScanned { get; set; }
-    public int Removed { get; set; }
-    public int Moved { get; set; }
-    public int Renamed { get; set; }
-    public int EmptyFoldersRemoved { get; set; }
     public int IgnoredFolders { get; set; }
     public int Errors { get; set; }
-
-    public void Add(Stats other)
-    {
-        ShortcutsScanned += other.ShortcutsScanned;
-        Removed += other.Removed;
-        Moved += other.Moved;
-        Renamed += other.Renamed;
-        EmptyFoldersRemoved += other.EmptyFoldersRemoved;
-        IgnoredFolders += other.IgnoredFolders;
-        Errors += other.Errors;
-    }
 }
 
 internal sealed record MenuRoot(string Label, string Path);
 
-internal sealed record ShortcutInfo(string TargetPath, string Arguments, string Description);
+internal sealed record ShortcutInfo(string TargetPath, string Arguments, string Description,
+    string WorkingDirectory = "", string IconPath = "", int IconIndex = 0,
+    int ShowCommand = 1, short Hotkey = 0, uint Flags = 0, string AppUserModelId = "");
 
 [SupportedOSPlatform("windows")]
 internal static class ShellLinkReader
@@ -1343,16 +1049,35 @@ internal static class ShellLinkReader
             persistFile.Load(path, 0);
 
             var link = (IShellLinkW)shellLink;
-            var target = new StringBuilder(1024);
-            var arguments = new StringBuilder(1024);
-            var description = new StringBuilder(1024);
+            var target = new StringBuilder(32768);
+            var arguments = new StringBuilder(32768);
+            var description = new StringBuilder(32768);
 
             link.GetPath(target, target.Capacity, IntPtr.Zero, 0);
             link.GetArguments(arguments, arguments.Capacity);
             link.GetDescription(description, description.Capacity);
 
-            info = new ShortcutInfo(target.ToString(), arguments.ToString(), description.ToString());
+            var workingDirectory = new StringBuilder(32768);
+            var icon = new StringBuilder(32768);
+            link.GetWorkingDirectory(workingDirectory, workingDirectory.Capacity);
+            link.GetIconLocation(icon, icon.Capacity, out int iconIndex);
+            link.GetShowCmd(out int showCommand);
+            link.GetHotkey(out short hotkey);
+            using var input = new BinaryReader(File.OpenRead(path));
+            input.BaseStream.Position = 20;
+            uint flags = input.ReadUInt32();
+            info = new ShortcutInfo(target.ToString(), arguments.ToString(), description.ToString(),
+                workingDirectory.ToString(), icon.ToString(), iconIndex, showCommand, hotkey, flags,
+                ShellLinkProperties.ReadAppUserModelId(shellLink));
             return true;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
         }
         catch (COMException)
         {
@@ -1369,6 +1094,25 @@ internal static class ShellLinkReader
                 Marshal.FinalReleaseComObject(shellLink);
             }
         }
+    }
+
+    public static void SetLaunchData(string path, string arguments, string? iconPath = null)
+    {
+        object shellLink = new ShellLinkCom();
+        try
+        {
+            var persist = (IPersistFile)shellLink;
+            persist.Load(path, 0);
+            ((IShellLinkW)shellLink).SetArguments(arguments);
+            if (iconPath is not null)
+            {
+                var currentIcon = new StringBuilder(32768);
+                ((IShellLinkW)shellLink).GetIconLocation(currentIcon, currentIcon.Capacity, out int iconIndex);
+                ((IShellLinkW)shellLink).SetIconLocation(iconPath, iconIndex);
+            }
+            persist.Save(path, true);
+        }
+        finally { Marshal.FinalReleaseComObject(shellLink); }
     }
 
     [ComImport]

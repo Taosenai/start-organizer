@@ -1,3 +1,5 @@
 /start-organizer.config.json
 /bin/
 /obj/
+**/bin/
+**/obj/
