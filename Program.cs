@@ -30,28 +30,20 @@ catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or C
 [SupportedOSPlatform("windows")]
 static int RunOnWindows(string[] args)
 {
-    if (args.Length == 1
-        && (args[0].Equals("-h", StringComparison.OrdinalIgnoreCase)
-            || args[0].Equals("--help", StringComparison.OrdinalIgnoreCase)))
+    CommandLineOptions command = CommandLineOptions.Parse(args);
+    if (command.Help)
     {
         PrintUsage();
         return 0;
     }
-
-    bool apply = args.Any(arg => arg.Equals("--apply", StringComparison.OrdinalIgnoreCase));
-    string? undo = null;
-    for (int i = 0; i < args.Length; i++)
+    if (command.Version)
     {
-        if (args[i].Equals("--apply", StringComparison.OrdinalIgnoreCase)) continue;
-        if (args[i].Equals("--undo", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
-        {
-            undo = args[++i];
-            continue;
-        }
-        throw new ArgumentException("Use --apply, --undo <backup-directory>, or --help.");
+        Console.WriteLine(typeof(Organizer).Assembly.GetName().Version?.ToString(3));
+        return 0;
     }
-    if (undo is not null) return BackupSession.Undo(undo, apply, MenuSafety.StartMenuRoots());
-    Options options = Options.LoadOrCreateDefaultConfig(apply);
+    if (command.Undo is not null)
+        return BackupSession.Undo(command.Undo, command.Apply, MenuSafety.StartMenuRoots());
+    Options options = Options.LoadOrCreateDefaultConfig(command.Apply, command.Config);
     var organizer = new Organizer(options);
     return organizer.Run();
 }
@@ -63,18 +55,21 @@ static void PrintUsage()
         start-organizer flattens Windows Start Menu shortcuts.
 
         Usage:
-          start-organizer [--apply]
+          start-organizer [--config <file>] [--apply]
           start-organizer --undo <backup-directory> [--apply]
           start-organizer --help
 
         Options:
           --apply      Make changes. Without this, a dry run is printed.
           --undo       Preview restoration of a backup; add --apply to restore.
+          --config     Use an existing config file instead of the current directory.
+          --version    Show the application version.
           -h, --help   Show help.
 
         Configuration:
           start-organizer reads start-organizer.config.json from the current directory.
-          If the file does not exist, it writes a default config there and continues.
+          If the default file does not exist, it writes one there and continues.
+          An explicitly selected --config file must already exist.
 
           All runtime settings except --apply are controlled by that config file.
         """);
@@ -115,7 +110,8 @@ internal sealed class Organizer
 
         if (_options.Apply && _options.IncludeGlobal && !IsAdministrator())
         {
-            Console.WriteLine("Note: the global Start Menu usually requires an elevated terminal.");
+            Console.Error.WriteLine("No changes applied: use an elevated terminal for the global Start Menu, or set includeGlobal to false.");
+            return 2;
         }
 
         List<MenuRoot> roots = GetMenuRoots(_options).ToList();
@@ -286,15 +282,12 @@ internal sealed class Organizer
             shellLink = readLink;
         }
         string displayName = Path.GetFileNameWithoutExtension(shortcut.Name);
-        if (ContainsRemovalTerm(displayName, out string nameTerm))
+        string url = string.Empty;
+        InternetShortcutReadStatus readStatus = InternetShortcutReadStatus.MissingUrl;
+        bool internetShortcut = shortcut.Extension.Equals(".url", StringComparison.OrdinalIgnoreCase);
+        if (internetShortcut)
         {
-            reason = $"name contains '{nameTerm}'";
-            return ShortcutDisposition.Remove;
-        }
-
-        if (shortcut.Extension.Equals(".url", StringComparison.OrdinalIgnoreCase))
-        {
-            InternetShortcutReadStatus readStatus = TryReadInternetShortcutUrl(shortcut.FullName, out string url, out string readError);
+            readStatus = TryReadInternetShortcutUrl(shortcut.FullName, out url, out string readError);
             if (readStatus == InternetShortcutReadStatus.ReadError)
             {
                 stats.Errors++;
@@ -302,10 +295,21 @@ internal sealed class Organizer
                 reason = string.Empty;
                 return ShortcutDisposition.Skip;
             }
+        }
+        // The app's English title may be "Docs". Suppress only the generic docs
+        // term for an identified Google Docs launcher, not help/uninstall/dead checks.
+        bool googleDocs = GoogleDocsShortcut.Matches(displayName, shellLink, internetShortcut ? url : null);
+        if (ContainsRemovalTerm(displayName, out string nameTerm, googleDocs))
+        {
+            reason = $"name contains '{nameTerm}'";
+            return ShortcutDisposition.Remove;
+        }
 
+        if (internetShortcut)
+        {
             if (readStatus == InternetShortcutReadStatus.FoundUrl)
             {
-                if (ContainsRemovalTerm(url, out string urlTerm))
+                if (ContainsRemovalTerm(url, out string urlTerm, googleDocs))
                 {
                     reason = $"URL contains '{urlTerm}'";
                     return ShortcutDisposition.Remove;
@@ -317,7 +321,7 @@ internal sealed class Organizer
                     return ShortcutDisposition.Remove;
                 }
             }
-            else if (readStatus == InternetShortcutReadStatus.MissingUrl && _options.RemoveDeadShortcuts)
+            else if (_options.RemoveDeadShortcuts)
             {
                 reason = "URL shortcut has no URL";
                 return ShortcutDisposition.Remove;
@@ -332,7 +336,7 @@ internal sealed class Organizer
                 return ShortcutDisposition.Remove;
             }
 
-            if (LooksLikeDocumentationTarget(link, out string documentationReason))
+            if (LooksLikeDocumentationTarget(link, out string documentationReason, googleDocs))
             {
                 reason = documentationReason;
                 return ShortcutDisposition.Remove;
@@ -372,7 +376,7 @@ internal sealed class Organizer
         return false;
     }
 
-    private bool LooksLikeDocumentationTarget(ShortcutInfo link, out string reason)
+    private bool LooksLikeDocumentationTarget(ShortcutInfo link, out string reason, bool googleDocs = false)
     {
         string extension = Path.GetExtension(link.TargetPath);
         bool documentFile = extension.Equals(".chm", StringComparison.OrdinalIgnoreCase)
@@ -384,7 +388,7 @@ internal sealed class Organizer
 
         string combined = $"{link.TargetPath} {link.Arguments} {link.Description}";
         if ((documentFile || LooksLikeWebShortcut(link.TargetPath, link.Arguments))
-            && ContainsRemovalTerm(combined, out string term))
+            && ContainsRemovalTerm(combined, out string term, googleDocs))
         {
             reason = $"target/arguments contain '{term}'";
             return true;
@@ -402,17 +406,17 @@ internal sealed class Organizer
             || arguments.Contains("https://", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static bool LooksLikeDeadShellLink(ShortcutInfo link, out string reason)
+    internal static bool LooksLikeDeadShellLink(ShortcutInfo link, out string reason)
     {
         reason = string.Empty;
         string targetPath = Environment.ExpandEnvironmentVariables(link.TargetPath.Trim());
 
-        if (!LooksLikeLocalFilesystemPath(targetPath))
+        if ((link.Flags & 0x1000) != 0 || !LooksLikeLocalFilesystemPath(targetPath))
         {
             return false;
         }
 
-        if (File.Exists(targetPath) || Directory.Exists(targetPath))
+        if (LocalTargetProbe.Probe(targetPath) != TargetAvailability.Missing)
         {
             return false;
         }
@@ -442,7 +446,7 @@ internal sealed class Organizer
             return false;
         }
 
-        if (File.Exists(targetPath) || Directory.Exists(targetPath))
+        if (LocalTargetProbe.Probe(targetPath) != TargetAvailability.Missing)
         {
             return false;
         }
@@ -488,9 +492,10 @@ internal sealed class Organizer
         return current;
     }
 
-    private bool ContainsRemovalTerm(string text, out string term)
+    private bool ContainsRemovalTerm(string text, out string term, bool googleDocs = false)
     {
-        return ContainsAnyNormalized(text, _removalTerms, out term);
+        return ContainsAnyNormalized(text,
+            googleDocs ? _removalTerms.Where(item => item.Normalized != "docs") : _removalTerms, out term);
     }
 
     private static bool ContainsAnyNormalized(string text, IEnumerable<NormalizedRemovalTerm> terms, out string matchingTerm)
@@ -648,12 +653,12 @@ internal sealed class Organizer
 
         if (options.IncludeLocal)
         {
-            yield return new MenuRoot("Local user Start Menu", local);
+            yield return new MenuRoot("Local user Start Menu", local, IsUserScope: true);
         }
 
         if (options.IncludeGlobal)
         {
-            yield return new MenuRoot("Global Start Menu", global);
+            yield return new MenuRoot("Global Start Menu", global, IsUserScope: false);
         }
     }
 
@@ -689,7 +694,8 @@ internal sealed class Options
     {
         AllowTrailingCommas = true,
         PropertyNameCaseInsensitive = true,
-        ReadCommentHandling = JsonCommentHandling.Skip
+        ReadCommentHandling = JsonCommentHandling.Skip,
+        UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow
     };
 
     private static readonly JsonSerializerOptions ConfigWriteOptions = new()
@@ -757,7 +763,7 @@ internal sealed class Options
     public bool OverwriteExistingShortcuts { get; private set; }
     public bool IncludeStartMenuRoot { get; private set; } = true;
     public bool DeduplicateShortcuts { get; private set; } = true;
-    public bool PreferNewerVersions { get; private set; } = true;
+    public bool PreferNewerVersions { get; private set; }
     public bool PreserveWslFolders { get; private set; } = true;
     public bool RepairWslShortcuts { get; private set; } = true;
     public string BackupDirectory { get; private set; } = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "start-organizer", "backups");
@@ -771,12 +777,15 @@ internal sealed class Options
     {
     }
 
-    public static Options LoadOrCreateDefaultConfig(bool apply)
+    public static Options LoadOrCreateDefaultConfig(bool apply, string? configFilePath = null)
     {
-        string configPath = Path.GetFullPath(Path.Combine(Environment.CurrentDirectory, DefaultConfigFileName));
+        string configPath = Path.GetFullPath(configFilePath
+            ?? Path.Combine(Environment.CurrentDirectory, DefaultConfigFileName));
 
         if (!File.Exists(configPath))
         {
+            if (configFilePath is not null)
+                throw new ArgumentException($"Explicit config file does not exist or is not accessible: {configPath}");
             WriteDefaultConfig(configPath);
         }
 
@@ -795,7 +804,9 @@ internal sealed class Options
 
         try
         {
-            File.WriteAllText(path, json);
+            using var output = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+            using var writer = new StreamWriter(output);
+            writer.Write(json);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException)
         {
@@ -805,15 +816,15 @@ internal sealed class Options
         Console.WriteLine($"Created default config: {path}");
     }
 
-    private static OrganizerConfig ReadConfig(string path)
+    internal static OrganizerConfig ReadConfig(string path)
     {
         try
         {
             string json = File.ReadAllText(path);
-            RejectApplyInConfig(path, json);
+            ValidateConfigDocument(path, json);
 
             return JsonSerializer.Deserialize<OrganizerConfig>(json, ConfigReadOptions)
-                ?? new OrganizerConfig();
+                ?? throw new ArgumentException($"Config must be a JSON object: {path}");
         }
         catch (JsonException ex)
         {
@@ -829,7 +840,7 @@ internal sealed class Options
         }
     }
 
-    private static void RejectApplyInConfig(string path, string json)
+    private static void ValidateConfigDocument(string path, string json)
     {
         using JsonDocument document = JsonDocument.Parse(
             json,
@@ -840,12 +851,13 @@ internal sealed class Options
             });
 
         if (document.RootElement.ValueKind != JsonValueKind.Object)
-        {
-            return;
-        }
+            throw new ArgumentException($"Config must be a JSON object: {path}");
 
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (JsonProperty property in document.RootElement.EnumerateObject())
         {
+            if (!names.Add(property.Name))
+                throw new ArgumentException($"Duplicate config property '{property.Name}': {path}");
             if (property.Name.Equals("apply", StringComparison.OrdinalIgnoreCase))
             {
                 throw new ArgumentException($"The apply setting is not supported in {path}. Use --apply on the command line instead.");
@@ -855,6 +867,17 @@ internal sealed class Options
 
     internal static Options FromConfig(OrganizerConfig config, bool apply = false)
     {
+        ArgumentNullException.ThrowIfNull(config);
+        foreach (var (name, values) in new (string, string[]?)[]
+        {
+            ("ignoredFolders", config.IgnoredFolders), ("ignoreFolders", config.IgnoreFolders),
+            ("ignores", config.Ignores), ("removeTerms", config.RemoveTerms),
+            ("removalTerms", config.RemovalTerms), ("preservedFolders", config.PreservedFolders)
+        })
+            if (values is not null && values.Any(string.IsNullOrWhiteSpace))
+                throw new ArgumentException($"{name} must contain non-empty strings, not null or blank entries.");
+        if (config.BackupDirectory is not null && string.IsNullOrWhiteSpace(config.BackupDirectory))
+            throw new ArgumentException("backupDirectory cannot be empty.");
         var options = new Options
         {
             Apply = apply,
@@ -867,7 +890,7 @@ internal sealed class Options
             OverwriteExistingShortcuts = config.OverwriteExistingShortcuts ?? false,
             IncludeStartMenuRoot = config.IncludeStartMenuRoot ?? true,
             DeduplicateShortcuts = config.DeduplicateShortcuts ?? true,
-            PreferNewerVersions = config.PreferNewerVersions ?? true,
+            PreferNewerVersions = config.PreferNewerVersions ?? false,
             PreserveWslFolders = config.PreserveWslFolders ?? true,
             RepairWslShortcuts = config.RepairWslShortcuts ?? true,
             BackupDirectory = Path.GetFullPath(Environment.ExpandEnvironmentVariables(config.BackupDirectory
@@ -896,6 +919,7 @@ internal sealed class Options
         AddNames(options.RemovalTerms, config.RemoveTerms);
         AddNames(options.RemovalTerms, config.RemovalTerms);
         options.PreservedFolders.AddRange(config.PreservedFolders ?? ["Visual Studio *"]);
+        options.Validate();
 
         return options;
     }
@@ -1010,7 +1034,7 @@ internal sealed class OrganizerConfig
             OverwriteExistingShortcuts = false,
             IncludeStartMenuRoot = true,
             DeduplicateShortcuts = true,
-            PreferNewerVersions = true,
+            PreferNewerVersions = false,
             PreserveWslFolders = true,
             RepairWslShortcuts = true,
             PreservedFolders = ["Visual Studio *"],
@@ -1028,7 +1052,7 @@ internal sealed class Stats
     public int Errors { get; set; }
 }
 
-internal sealed record MenuRoot(string Label, string Path);
+internal sealed record MenuRoot(string Label, string Path, bool IsUserScope = true);
 
 internal sealed record ShortcutInfo(string TargetPath, string Arguments, string Description,
     string WorkingDirectory = "", string IconPath = "", int IconIndex = 0,

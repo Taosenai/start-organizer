@@ -33,7 +33,7 @@ internal sealed record MenuAction(string Kind, string Source, string? Destinatio
 internal sealed class MenuPlan
 {
     private static readonly Regex VersionDirectory = new(
-        @"(?<=\\)(?<prefix>app-)?(?<version>\d+(?:\.\d+){1,3})(?=\\|$)", RegexOptions.IgnoreCase);
+        @"(?<=\\)(?<prefix>app-)(?<version>\d+(?:\.\d+){1,3})(?=\\|$)", RegexOptions.IgnoreCase);
     private static readonly Regex WslId = new(
         @"(?<prefix>--distribution-id\s+)(?<id>\{[a-f0-9-]+\})", RegexOptions.IgnoreCase);
     private static readonly StringComparer Paths = StringComparer.OrdinalIgnoreCase;
@@ -59,19 +59,23 @@ internal sealed class MenuPlan
         }
         foreach (var candidate in candidates)
         {
+            candidate.RepairArguments = null;
+            candidate.RepairIconPath = null;
+            candidate.PreserveDirectory = null;
             string? top = TopFolder(candidate);
             if (top is not null && (wslFolders.Contains(top) || IsPreserved(candidate, options)))
                 candidate.PreserveDirectory = candidate.File.DirectoryName;
             InspectWrapper(candidate, options, distributions, plan.Diagnostics);
         }
         foreach (var nameGroup in candidates.GroupBy(c => c.DestinationName, Paths))
-            if (nameGroup.Select(c => c.Root.Path).Distinct(Paths).Count() > 1
-                && nameGroup.Select(c => LaunchKey(c, options)).Distinct(StringComparer.Ordinal).Count() > 1)
-                plan.Diagnostics.Add($"Distinct launch settings across user/system menus; choose manually: {nameGroup.Key}");
+            if (nameGroup.Select(c => c.Root.Path).Distinct(Paths).Count() > 1)
+                plan.Diagnostics.Add($"User/system menu scopes are kept separate: {nameGroup.Key}");
 
         var survivors = new List<ShortcutCandidate>();
         // An ordinal key keeps case-sensitive arguments distinct; only paths are folded.
-        foreach (var group in candidates.GroupBy(c => c.DestinationName.ToUpperInvariant() + "\0" + LaunchKey(c, options)))
+        // Never remove a shared launcher in favor of a per-user copy (or vice versa).
+        foreach (var group in candidates.GroupBy(c => c.Root.Path.ToUpperInvariant() + "\0"
+            + c.DestinationName.ToUpperInvariant() + "\0" + LaunchKey(c, options)))
         {
             var members = group.ToList();
             if (!options.DeduplicateShortcuts || LaunchKey(members[0], options) is null)
@@ -172,7 +176,7 @@ internal sealed class MenuPlan
 
     private static string FoldPath(string path) => Environment.ExpandEnvironmentVariables(path).TrimEnd('\\').ToUpperInvariant();
     private static string FamilyPath(string path, bool versions) => versions
-        ? VersionDirectory.Replace(FoldPath(path), "${prefix}{VERSION}") : FoldPath(path);
+        ? VersionDirectory.Replace(FoldPath(path), NormalizeVersionDirectory) : FoldPath(path);
 
     private static string? LaunchKey(ShortcutCandidate c, Options options)
     {
@@ -200,9 +204,12 @@ internal sealed class MenuPlan
         if (!folded.StartsWith(applicationRoot, StringComparison.OrdinalIgnoreCase)) return folded;
         // A stable launcher may have app-1.2 working/icon directories (Squirrel-style updates).
         // Arbitrary numbered user workspaces are not evidence of application versions.
-        return VersionDirectory.Replace(folded, match => targetVersion.Success || match.Groups["prefix"].Success
-            ? match.Groups["prefix"].Value + "{VERSION}" : match.Value);
+        return VersionDirectory.Replace(folded, NormalizeVersionDirectory);
     }
+
+    private static string NormalizeVersionDirectory(Match match) =>
+        Version.TryParse(match.Groups["version"].Value, out _)
+            ? match.Groups["prefix"].Value + "{VERSION}" : match.Value;
 
     private static bool HasValidLaunchPaths(ShortcutCandidate c) => c.Link is null
         || string.IsNullOrEmpty(c.Link.WorkingDirectory)
@@ -212,7 +219,8 @@ internal sealed class MenuPlan
     {
         if (!options.PreferNewerVersions || c.Link is null) return [];
         return VersionDirectory.Matches(c.Link.TargetPath + "\\" + c.Link.WorkingDirectory + "\\" + c.Link.IconPath)
-            .Select(match => Version.Parse(match.Groups["version"].Value)).ToList();
+            .Select(match => Version.TryParse(match.Groups["version"].Value, out var version) ? version : null)
+            .OfType<Version>().ToList();
     }
 
     private sealed class VersionListComparer : IComparer<List<Version>>
@@ -255,8 +263,11 @@ internal sealed class MenuPlan
     {
         if (c.Link is not { } link) return;
         string executable = Path.GetFileName(link.TargetPath);
-        if (executable.Equals("wsl.exe", StringComparison.OrdinalIgnoreCase)
-            || executable.Equals("wslg.exe", StringComparison.OrdinalIgnoreCase))
+        bool wsl = executable.Equals("wsl.exe", StringComparison.OrdinalIgnoreCase)
+            || executable.Equals("wslg.exe", StringComparison.OrdinalIgnoreCase);
+        if (wsl && !c.Root.IsUserScope)
+            diagnostics.Add($"Shared WSL launcher: current-user registrations are not used to validate or repair {c.File.FullName}");
+        if (wsl && c.Root.IsUserScope)
         {
             Match match = WslId.Match(link.Arguments);
             if (match.Success && !distributions.ContainsKey(match.Groups["id"].Value))
@@ -323,7 +334,7 @@ internal sealed class MenuPlan
             if (roots.Any(root => MenuSafety.Within(options.BackupDirectory, Path.GetDirectoryName(root.Path)!)
                 || Paths.Equals(options.BackupDirectory, Path.GetDirectoryName(root.Path))))
                 throw new ArgumentException("Place backupDirectory outside the Start Menu.");
-            backup = BackupSession.Create(options.BackupDirectory, Preconditions.Keys, touched);
+            backup = BackupSession.Create(options.BackupDirectory, Preconditions, touched);
             backup.Verify(Preconditions.Keys);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)

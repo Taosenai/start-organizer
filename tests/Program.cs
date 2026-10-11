@@ -12,14 +12,16 @@ void Check(bool condition, string message)
     if (!condition) throw new InvalidOperationException(message);
 }
 
-Test("loose root duplicates and cross-scope duplicates retain one Programs launcher", () =>
+Test("loose root duplicates consolidate within their own menu scope", () =>
 {
     using var f = new Fixture();
     var loose = f.Link(f.User, "../App.lnk");
     var root = f.Link(f.User, "App.lnk");
     var global = f.Link(f.System, "Vendor/App.lnk");
     var plan = f.Plan([loose, root, global]);
-    Check(plan.Actions.Count(a => a.Kind == "Deduplicate") == 2, "Expected two duplicate removals");
+    Check(plan.Actions.Count(a => a.Kind == "Deduplicate") == 1, "Only the local duplicate should be removed");
+    Check(!plan.Actions.Any(a => a.Kind == "Deduplicate" && a.Source == global.File.FullName), "Shared launcher was deleted");
+    Check(plan.Actions.Any(a => a.Source == global.File.FullName && a.Destination == Path.Combine(f.System.Path, "App.lnk")), "Shared launcher should stay in the shared menu");
     Check(plan.Actions.All(a => a.Source != root.File.FullName), "Canonical Programs shortcut must survive");
 });
 
@@ -76,7 +78,7 @@ Test("newer valid versioned working directory wins regardless of timestamps", ()
     var old = f.Link(f.User, "App.lnk", workingDirectory: oldDirectory);
     var newer = f.Link(f.User, "Vendor/App.lnk", workingDirectory: newDirectory);
     File.SetLastWriteTimeUtc(old.File.FullName, DateTime.UtcNow.AddYears(1));
-    var plan = f.Plan([old, newer]);
+    var plan = f.Plan([old, newer], new OrganizerConfig { PreferNewerVersions = true });
     Check(plan.Actions.Any(a => a.Kind == "Deduplicate" && a.Source == old.File.FullName), "Old version must be superseded");
     Check(plan.Actions.Any(a => a.Kind == "Replace" && a.Source == newer.File.FullName), "Replacement must be explicit");
     var disabled = f.Plan([old, newer], new OrganizerConfig { PreferNewerVersions = false });
@@ -90,7 +92,7 @@ Test("an unavailable newer working directory is not chosen or silently discarded
     Directory.CreateDirectory(validDirectory);
     var old = f.Link(f.User, "App.lnk", workingDirectory: validDirectory);
     var unavailable = f.Link(f.User, "Vendor/App.lnk", workingDirectory: Path.Combine(f.DirectoryPath, "app-2.0"));
-    var plan = f.Plan([old, unavailable]);
+    var plan = f.Plan([old, unavailable], new OrganizerConfig { PreferNewerVersions = true });
     Check(!plan.Actions.Any(a => a.Kind == "Deduplicate"), "Unavailable newer variant must be preserved");
     Check(plan.Diagnostics.Any(d => d.Contains("Missing working directory")), "Need diagnostic");
 });
@@ -104,7 +106,7 @@ Test("numbered user working directories are not mistaken for app versions", () =
     Directory.CreateDirectory(second);
     var a = f.Link(f.User, "App.lnk", workingDirectory: first);
     var b = f.Link(f.User, "Vendor/App.lnk", workingDirectory: second);
-    Check(!f.Plan([a, b]).Actions.Any(action => action.Kind == "Deduplicate"), "User workspaces were discarded");
+    Check(!f.Plan([a, b], new OrganizerConfig { PreferNewerVersions = true }).Actions.Any(action => action.Kind == "Deduplicate"), "User workspaces were discarded");
 });
 
 Test("empty removeTerms disables uninstaller and documentation rules", () =>
@@ -203,7 +205,7 @@ Test("dry run writes nothing; apply, undo, and repeated undo restore original by
     var old = f.Link(f.User, "App.lnk", workingDirectory: oldDirectory);
     var newer = f.Link(f.User, "Vendor/App.lnk", workingDirectory: newDirectory);
     var before = f.Snapshot();
-    var plan = f.Plan([old, newer]);
+    var plan = f.Plan([old, newer], new OrganizerConfig { PreferNewerVersions = true });
     Check(plan.Execute(f.Options(false), f.Roots) == 0, "Dry run failed");
     Check(before.SequenceEqual(f.Snapshot()), "Dry run mutated menu");
     Check(!Directory.Exists(f.Backups), "Dry run created backup");
@@ -289,6 +291,8 @@ Test("failed apply stops before later actions and undo recovers the completed po
     Check(before.SequenceEqual(f.Snapshot()), "Partial apply did not restore original bytes");
 });
 
+ReleaseSafetyTests.Run(Test, Check);
+
 Console.WriteLine($"{passed} passed; {failed} failed.");
 return failed == 0 ? 0 : 1;
 
@@ -304,7 +308,7 @@ sealed class Fixture : IDisposable
     public Fixture()
     {
         User = new MenuRoot("User", Path.Combine(DirectoryPath, "UserMenu", "Programs"));
-        System = new MenuRoot("System", Path.Combine(DirectoryPath, "SystemMenu", "Programs"));
+        System = new MenuRoot("System", Path.Combine(DirectoryPath, "SystemMenu", "Programs"), IsUserScope: false);
         foreach (var root in Roots) Directory.CreateDirectory(root.Path);
         _target = Path.Combine(DirectoryPath, "app.exe");
         File.WriteAllText(_target, "test fixture; never executed");
