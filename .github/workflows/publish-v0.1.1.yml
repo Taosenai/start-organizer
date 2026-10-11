@@ -1,0 +1,151 @@
+name: Publish v0.1.1
+
+# One-off publishing job requested by the repository owner. This branch is not
+# merged into main; the tag and release target the reviewed merge commit below.
+on:
+  push:
+    branches: [publish-v0.1.1]
+    paths: [.github/workflows/publish-v0.1.1.yml]
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: publish-v0.1.1
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'Taosenai/start-organizer'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: Taosenai/start-organizer
+      TARGET_SHA: 9f47a6101b9cd85e47f1d53e1c781d82ff781a6a
+      BUILD_RUN: '38166034589'
+      RELEASE_TAG: v0.1.1
+    steps:
+      - name: Verify the merged commit and successful Windows build
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "repos/$GH_REPO/pulls/1" > pr.json
+          jq -e --arg sha "$TARGET_SHA" '.merged == true and .merge_commit_sha == $sha' pr.json
+          gh api "repos/$GH_REPO/git/ref/heads/main" > main.json
+          jq -e --arg sha "$TARGET_SHA" '.object.sha == $sha' main.json
+          gh api "repos/$GH_REPO/actions/runs/$BUILD_RUN" > build.json
+          jq -e --arg sha "$TARGET_SHA" '
+            .head_sha == $sha and .head_branch == "main" and
+            .event == "push" and .path == ".github/workflows/verify.yml" and
+            .status == "completed" and .conclusion == "success"
+          ' build.json
+
+      - name: Download and verify the exact release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh run download "$BUILD_RUN" --repo "$GH_REPO" --name start-organizer-win-x64 --dir assets
+          python3 - <<'PY'
+          import hashlib
+          import pathlib
+          import re
+          import zipfile
+
+          folder = pathlib.Path('assets')
+          archive = 'start-organizer-v0.1.1-win-x64.zip'
+          expected = {archive, 'SHA256SUMS.txt'}
+          if {p.name for p in folder.iterdir()} != expected:
+              raise SystemExit('Unexpected build artifact contents')
+          sums = (folder / 'SHA256SUMS.txt').read_text(encoding='ascii').strip()
+          match = re.fullmatch(r'([a-f0-9]{64})  ' + re.escape(archive), sums)
+          if not match:
+              raise SystemExit('Unexpected checksum file format')
+          with (folder / archive).open('rb') as stream:
+              actual = hashlib.file_digest(stream, 'sha256').hexdigest()
+          if actual != match[1]:
+              raise SystemExit('Release ZIP checksum mismatch')
+          with zipfile.ZipFile(folder / archive) as zipped:
+              names = [item.filename.replace('\\', '/') for item in zipped.infolist() if not item.is_dir()]
+              expected_members = {'start-organizer.exe', 'README.md', 'docs/configuration.md', 'docs/releasing.md'}
+              if len(names) != len(expected_members) or set(names) != expected_members:
+                  raise SystemExit(f'Unexpected release ZIP members: {names}')
+              if zipped.testzip() is not None:
+                  raise SystemExit('Release ZIP integrity check failed')
+          print(f'Verified {archive}: SHA256 {actual}')
+          PY
+
+      - name: Stage release with verified assets and concise notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Do not overwrite any existing release, whether draft or published.
+          existing="$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq '.[] | select(.tag_name == "v0.1.1") | .id')"
+          if [[ -n "$existing" ]]; then
+            echo 'v0.1.1 already exists; refusing to replace it.' >&2
+            exit 1
+          fi
+          tag_sha="$(gh api "repos/$GH_REPO/git/matching-refs/tags/v0.1.1" --jq '.[] | select(.ref == "refs/tags/v0.1.1") | .object.sha')"
+          if [[ -n "$tag_sha" && "$tag_sha" != "$TARGET_SHA" ]]; then
+            echo 'Existing tag points to a different object; refusing to move it.' >&2
+            exit 1
+          fi
+          cat > release-notes.md <<'NOTES'
+          A safety and usability update for Start Menu Organizer.
+
+          ### Download and run
+
+          Download `start-organizer-v0.1.1-win-x64.zip`, extract it, and run `start-organizer.exe` from a terminal to preview changes. Add `--apply` to apply the plan after reviewing it. Use an elevated terminal when including the shared Start Menu. The Windows x64 executable includes .NET; no separate runtime installation is required.
+
+          Each apply saves a backup. `--undo <backup-directory>` previews restoration; add `--apply` to restore. `SHA256SUMS.txt` contains the ZIP checksum.
+
+          ### Changes
+
+          - Keep duplicate consolidation within each user/shared menu scope; never remove a shared launcher in favor of a personal copy. WSL repairs are limited to the current user's shortcuts.
+          - Keep `removeDeadShortcuts` enabled, but distinguish confirmed missing local targets from inaccessible/offline storage and network drives.
+          - Keep documentation/uninstaller cleanup enabled, with a narrow Google Docs exception covering recognized browser/PWA `.lnk` and `.url` launchers.
+          - Make application-version preference opt-in and restrict it to `app-<version>` directories. Existing explicit settings remain honored.
+          - Add `--config <existing-file>` and `--version`; reject misspelled settings and invalid configuration instead of silently using defaults.
+          - Strengthen backup and undo checks against changes during a run. Shorten the README and add configuration/release notes.
+
+          ### Validation and limitations
+
+          Built from the merged `main` commit `9f47a6101b9cd85e47f1d53e1c781d82ff781a6a`. [Windows verification](https://github.com/Taosenai/start-organizer/actions/runs/38166034589) passed, including the shortcut regression suite and extracted-ZIP startup/configuration checks.
+
+          Review the preview: documentation cleanup remains opinionated. Apply/undo are not atomic transactions; close installers/updaters while using them. The executable is unsigned. License selection and manual clean-machine/second-account testing remain outstanding; no licensing terms or repository visibility changes are included in this release.
+
+          Full changes: #1.
+          NOTES
+          gh release create "$RELEASE_TAG" \
+            assets/start-organizer-v0.1.1-win-x64.zip assets/SHA256SUMS.txt \
+            --repo "$GH_REPO" --target "$TARGET_SHA" \
+            --title 'Start Menu Organizer v0.1.1' --notes-file release-notes.md --draft
+
+      - name: Verify uploaded bytes and publish the release
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" > release.json
+          jq -e --arg sha "$TARGET_SHA" '
+            .draft == true and .prerelease == false and .target_commitish == $sha and
+            ([.assets[].name] | sort) == ["SHA256SUMS.txt", "start-organizer-v0.1.1-win-x64.zip"]
+          ' release.json
+          gh release download "$RELEASE_TAG" --repo "$GH_REPO" --dir readback \
+            --pattern start-organizer-v0.1.1-win-x64.zip --pattern SHA256SUMS.txt
+          cmp assets/SHA256SUMS.txt readback/SHA256SUMS.txt
+          cmp assets/start-organizer-v0.1.1-win-x64.zip readback/start-organizer-v0.1.1-win-x64.zip
+          gh release edit "$RELEASE_TAG" --repo "$GH_REPO" --draft=false --latest
+          gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" > published.json
+          jq -e '.draft == false and .prerelease == false and .published_at != null and (.assets | length) == 2' published.json
+          gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" > tag.json
+          jq -e --arg sha "$TARGET_SHA" '.object.type == "commit" and .object.sha == $sha' tag.json
+          {
+            echo '## Published v0.1.1'
+            echo
+            jq -r '.html_url' published.json
+            echo
+            echo "Source commit: $TARGET_SHA"
+            echo "Verified Windows build: $BUILD_RUN"
+            cat assets/SHA256SUMS.txt
+          } >> "$GITHUB_STEP_SUMMARY"
