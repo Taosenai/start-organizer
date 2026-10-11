@@ -70,14 +70,19 @@ try {
     if ($LASTEXITCODE -ne 0 -or $help -notmatch 'Usage:') { throw 'Extracted executable help smoke test failed.' }
     $reportedVersion = (& $exe --version) -join "`n"
     if ($LASTEXITCODE -ne 0 -or $reportedVersion.Trim() -ne $version) { throw 'Extracted executable version smoke test failed.' }
-    if (@(Get-ChildItem -LiteralPath $bundle -Filter 'coreclr.dll' -Recurse -Force).Count -eq 0) {
-        Write-Host 'Native bundle diagnostic listing:'
-        Get-ChildItem -LiteralPath $work -Recurse -Force | Select-Object FullName, Attributes, Length | Format-Table -AutoSize | Out-Host
-        if (Test-Path -LiteralPath $env:DOTNET_HOST_TRACEFILE) {
-            Get-Content -LiteralPath $env:DOTNET_HOST_TRACEFILE | Select-String -Pattern 'bundle|extract|coreclr|self-contained|framework|hostpolicy' | Select-Object -First 80 | Out-Host
-        }
-        throw 'The extracted executable did not extract its bundled native .NET runtime.'
+    # .NET 10's Windows single-file host statically links CoreCLR. It need not
+    # extract coreclr.dll. Check the actual startup mode instead of assuming a
+    # particular native-library layout or accepting the runner's installed .NET.
+    # https://github.com/dotnet/runtime/blob/v10.0.0/src/native/corehost/apphost/static/CMakeLists.txt
+    $trace = Get-Content -LiteralPath $env:DOTNET_HOST_TRACEFILE -Raw
+    if ($trace -notmatch 'Detected Single-File app bundle' -or
+        $trace -notmatch 'Executing as a self-contained app' -or
+        $trace -notmatch 'Using internal hostpolicy' -or
+        $trace -match 'Executing as a framework-dependent app') {
+        Write-Host $trace
+        throw 'Extracted ZIP did not start as a self-contained single-file application.'
     }
+    Write-Host 'Extracted ZIP verified: self-contained single-file host, not an installed .NET framework.'
     if (Test-Path -LiteralPath (Join-Path $smoke 'start-organizer.config.json')) {
         throw 'Informational CLI options unexpectedly created a config.'
     }
