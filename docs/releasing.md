@@ -20,9 +20,9 @@ owner decision open rather than selecting terms on the owner's behalf.
    shared launcher remains available to the other account. Keep application
    installers/updaters closed. Do not use a production Start Menu as a test fixture.
 4. Test the extracted ZIP on a Windows x64 machine without a separate .NET runtime.
-   CI already tests the ZIP in an isolated directory with the bundled native
-   runtime, but is not a substitute for this clean-machine check or SmartScreen
-   behavior for an unsigned download.
+   CI already tests the ZIP in an isolated directory and verifies self-contained
+   startup using the host trace, but is not a substitute for this clean-machine
+   check or SmartScreen behavior for an unsigned download.
 5. Tag the reviewed commit as `v0.1.1` and create a new release containing the ZIP
    and `SHA256SUMS.txt` from `artifacts`. Do not replace the existing `v0.1.0` assets.
    Include the license in the package. Nothing in CI publishes or changes visibility.
@@ -30,8 +30,10 @@ owner decision open rather than selecting terms on the owner's behalf.
 The release script runs the custom test executable (not `dotnet test`), publishes
 a self-contained single executable with native runtime libraries included,
 packages only the executable/docs/license, and tests `--help`, `--version`, and
-invalid explicit configuration against the extracted ZIP. Native bundle extraction
-is checked. Config files and backups are never included in the ZIP.
+invalid explicit configuration against the extracted ZIP. The host trace must
+confirm a self-contained single-file app using its internal host policy; the
+.NET 10 Windows host embeds CoreCLR directly, so extracting `coreclr.dll` is not
+required. Config files and backups are never included in the ZIP.
 
 The binaries are not code-signed. The source path mapping removes local build
 paths from embedded symbols; this is not a full binary/history privacy audit.
