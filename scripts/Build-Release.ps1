@@ -21,7 +21,7 @@ $version = [string]([xml](Get-Content -LiteralPath $project -Raw)).Project.Prope
 if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "Unexpected project version: $version" }
 $work = Join-Path ([IO.Path]::GetTempPath()) ('start-organizer-release-' + [guid]::NewGuid().ToString('N'))
 $environment = @{}
-foreach ($name in @('DOTNET_ROOT', 'DOTNET_ROOT_X64', 'DOTNET_MULTILEVEL_LOOKUP', 'DOTNET_BUNDLE_EXTRACT_BASE_DIR')) {
+foreach ($name in @('DOTNET_ROOT', 'DOTNET_ROOT_X64', 'DOTNET_MULTILEVEL_LOOKUP', 'DOTNET_BUNDLE_EXTRACT_BASE_DIR', 'DOTNET_HOST_TRACE', 'DOTNET_HOST_TRACEFILE', 'DOTNET_HOST_TRACE_VERBOSITY')) {
     $environment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
 }
 
@@ -38,7 +38,7 @@ try {
 
     $publish = Join-Path $work 'publish'
     Invoke-DotNet -Arguments @('publish', $project, '-c', 'Release', '-r', 'win-x64', '--self-contained', 'true', '-o', $publish)
-    if (@(Get-ChildItem -LiteralPath $publish -Filter '*.dll').Count -ne 0) {
+    if (@(Get-ChildItem -LiteralPath $publish -Filter '*.dll' -Force).Count -ne 0) {
         throw 'Publish left loose DLLs; the single-file package would be incomplete.'
     }
     $stage = Join-Path $work 'stage'
@@ -61,13 +61,21 @@ try {
     $env:DOTNET_ROOT_X64 = $emptyRuntime
     $env:DOTNET_MULTILEVEL_LOOKUP = '0'
     $env:DOTNET_BUNDLE_EXTRACT_BASE_DIR = $bundle
+    $env:DOTNET_HOST_TRACE = '1'
+    $env:DOTNET_HOST_TRACEFILE = Join-Path $work 'host-trace.txt'
+    $env:DOTNET_HOST_TRACE_VERBOSITY = '4'
     Set-Location $smoke
 
     $help = (& $exe --help) -join "`n"
     if ($LASTEXITCODE -ne 0 -or $help -notmatch 'Usage:') { throw 'Extracted executable help smoke test failed.' }
     $reportedVersion = (& $exe --version) -join "`n"
     if ($LASTEXITCODE -ne 0 -or $reportedVersion.Trim() -ne $version) { throw 'Extracted executable version smoke test failed.' }
-    if (@(Get-ChildItem -LiteralPath $bundle -Filter 'coreclr.dll' -Recurse).Count -eq 0) {
+    if (@(Get-ChildItem -LiteralPath $bundle -Filter 'coreclr.dll' -Recurse -Force).Count -eq 0) {
+        Write-Host 'Native bundle diagnostic listing:'
+        Get-ChildItem -LiteralPath $work -Recurse -Force | Select-Object FullName, Attributes, Length | Format-Table -AutoSize | Out-Host
+        if (Test-Path -LiteralPath $env:DOTNET_HOST_TRACEFILE) {
+            Get-Content -LiteralPath $env:DOTNET_HOST_TRACEFILE | Select-String -Pattern 'bundle|extract|coreclr|self-contained|framework|hostpolicy' | Select-Object -First 80 | Out-Host
+        }
         throw 'The extracted executable did not extract its bundled native .NET runtime.'
     }
     if (Test-Path -LiteralPath (Join-Path $smoke 'start-organizer.config.json')) {
@@ -93,3 +101,5 @@ finally {
     foreach ($name in $environment.Keys) { [Environment]::SetEnvironmentVariable($name, $environment[$name], 'Process') }
     if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
 }
+# Intentional negative CLI tests leave LASTEXITCODE=1; the validated script succeeded.
+exit 0
