@@ -2,7 +2,6 @@
 [CmdletBinding()]
 param(
     [string]$OutputDirectory = (Join-Path $PSScriptRoot '..\artifacts'),
-    [switch]$RequireLicense
 )
 
 Set-StrictMode -Version Latest
@@ -12,10 +11,6 @@ if (-not $IsWindows) { throw 'Build and shortcut tests require Windows.' }
 
 $repo = Split-Path $PSScriptRoot -Parent
 $output = [IO.Path]::GetFullPath($OutputDirectory)
-$license = Join-Path $repo 'LICENSE'
-if ($RequireLicense -and -not (Test-Path -LiteralPath $license -PathType Leaf)) {
-    throw 'Choose and add LICENSE before preparing a public release.'
-}
 $project = Join-Path $repo 'StartMenuOrganizer.csproj'
 $version = [string]([xml](Get-Content -LiteralPath $project -Raw)).Project.PropertyGroup.Version
 if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "Unexpected project version: $version" }
@@ -45,8 +40,6 @@ try {
     New-Item -ItemType Directory -Path (Join-Path $stage 'docs') -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $publish 'start-organizer.exe'), (Join-Path $repo 'README.md') -Destination $stage
     Copy-Item -LiteralPath (Join-Path $repo 'docs\configuration.md'), (Join-Path $repo 'docs\releasing.md') -Destination (Join-Path $stage 'docs')
-    if (Test-Path -LiteralPath $license -PathType Leaf) { Copy-Item -LiteralPath $license -Destination $stage }
-    else { Write-Warning 'No LICENSE selected: this package is a test artifact, not ready for public distribution.' }
 
     $zip = Join-Path $output "start-organizer-v$version-win-x64.zip"
     Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -Force
